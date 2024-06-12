@@ -1,14 +1,15 @@
+import os
 import cv2
 import numpy as np
 import pyrealsense2 as rs
 from ultralytics import YOLO
 import matplotlib
-matplotlib.use('TkAgg')  
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-def calculate_3d(x, y, depth_frame, intrinsics, w, h, window_size=10):
+def calculate_3d(x, y, depth_data, intrinsics, w, h, window_size=10):
     if x == 0 and y == 0:
         return 0.0, 0.0, 0.0, 0.0
 
@@ -20,7 +21,7 @@ def calculate_3d(x, y, depth_frame, intrinsics, w, h, window_size=10):
             y_pixel = int(y) + j
 
             if 0 <= x_pixel < w and 0 <= y_pixel < h:
-                depth = depth_frame.get_distance(x_pixel, y_pixel)
+                depth = depth_data[y_pixel, x_pixel]
                 if depth != 0 and depth < min_depth:
                     min_depth = depth
 
@@ -30,7 +31,7 @@ def calculate_3d(x, y, depth_frame, intrinsics, w, h, window_size=10):
     pixel = [x, y]
     depth = min_depth
 
-    point = rs.rs2_deproject_pixel_to_point(intrinsics, pixel, depth)
+    point = rs.rs2_deproject_pixel_to_point(intrinsics, pixel, depth / 1000.0)  # Convert depth to meters
 
     x_3d, z_3d, y_3d = point
 
@@ -50,51 +51,51 @@ def calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length):
     arrow_end = p4 + arrow_length * normal_xy
 
     p5_xy = np.array([p5[0], p5[1], 0])
-    angleX_camera_body = np.arctan2(p5[1], p5[0])
-    angleX_camera_body_degrees = np.degrees(angleX_camera_body)
+    angleX_camera_neck = np.arctan2(p5[1], p5[0])
+    angleX_camera_neck_degrees = np.degrees(angleX_camera_neck)
 
     def line_intersection(p1, p2, p3, p4):
         a1, b1 = p1[:2]
         a2, b2 = p2[:2]
         a3, b3 = p3[:2]
         a4, b4 = p4[:2]
-        
+
         denominator = (a1 - a2) * (b3 - b4) - (b1 - b2) * (a3 - a4)
         if denominator == 0:
             return None
-        
+
         intersection_x = ((a1 * b2 - b1 * a2) * (a3 - a4) - (a1 - a2) * (a3 * b4 - b3 * a4)) / denominator
         intersection_y = ((a1 * b2 - b1 * a2) * (b3 - b4) - (b1 - b2) * (a3 * b4 - b3 * a4)) / denominator
         return np.array([intersection_x, intersection_y, 0])
 
     intersection = line_intersection([0, 0, 0], p5, arrow_start, arrow_end)
-    
+
     if intersection is not None:
         orientation = np.arctan2(intersection[1], intersection[0])
         orientation_degrees = np.degrees(orientation)
     else:
         orientation_degrees = None
 
-    return arrow_start, arrow_end, angleX_camera_body_degrees, orientation_degrees
+    return arrow_start, arrow_end, angleX_camera_neck_degrees, orientation_degrees
 
-# Initialize the RealSense pipeline
+# Initialize the RealSense pipeline for intrinsics only
 pipeline = rs.pipeline()
 config = rs.config()
 
-# Configure the RGB and Depth streams with a resolution of 1280x720
-config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+# Enable only RGB stream to get the intrinsics
 config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
 # Start the pipeline with the specified configuration
 profile = pipeline.start(config)
-
-# Create an align object
-align_to = rs.stream.color
-align = rs.align(align_to)
+# Get the depth sensor and set its options
 depth_sensor = profile.get_device().first_depth_sensor()
-depth_sensor.set_option(rs.option.frames_queue_size, 2)
+
+depth_sensor.set_option(rs.option.frames_queue_size, 5)
 # Get the intrinsic parameters of the RGB sensor
 color_intrinsics = profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
+
+# Stop the pipeline as we don't need it for further processing
+pipeline.stop()
 
 # Initialize the YOLO detector
 model = YOLO('yolov8n-pose')
@@ -109,7 +110,7 @@ index_to_label = {
 
 # Define keypoint connections for drawing lines
 keypoint_connections = [
-    (0, 1), (0, 2), (5 , 6), (11, 12), (2, 4), (1, 3), (5, 7),
+    (0, 1), (0, 2), (5, 6), (11, 12), (2, 4), (1, 3), (5, 7),
     (7, 9), (6, 8), (8, 10), (11, 13), (13, 15),
     (12, 14), (14, 16)
 ]
@@ -120,7 +121,7 @@ ax = fig.add_subplot(111, projection='3d')
 
 # Set fixed limits for the axes
 ax.set_xlim(-4, 4)
-ax.set_ylim(0 , 4)
+ax.set_ylim(0, 4)
 ax.set_zlim(-1, 3)
 
 # Set the axis labels to match the new orientation
@@ -160,25 +161,24 @@ arrow_plots = []  # Store arrow plots
 sector_plots = []  # Store sector plots
 circle_plots = []  # Store circle plots
 
+# Ask the user for a number to replace the file names
+file_number = input("Enter a number to name the files: ")
+
+# Define paths to the directories
+color_path = f'/home/mohamed/ros2_ws/dataset/rgb/{file_number}_rgb'
+depth_raw_path = f'/home/mohamed/ros2_ws/dataset/raw/{file_number}_depth'
+
+# Get list of files
+color_files = sorted([f for f in os.listdir(color_path) if f.endswith('.png')])
+depth_raw_dirs = sorted([d for d in os.listdir(depth_raw_path) if os.path.isdir(os.path.join(depth_raw_path, d))])
+
 try:
-    while True:
-        # Acquire frames from the RealSense pipeline
-        frames = pipeline.wait_for_frames()
+    for frame_idx, color_file in enumerate(color_files):
+        color_image = cv2.imread(os.path.join(color_path, color_file))
 
-        # Align the depth frame to the color frame
-        aligned_frames = align.process(frames)
-
-        # Get the aligned depth and color frames
-        aligned_depth_frame = aligned_frames.get_depth_frame()
-        color_frame = aligned_frames.get_color_frame()
-
-        # Verify that the frames are valid
-        if not aligned_depth_frame or not color_frame:
-            continue
-
-        # Convert frames to numpy arrays
-        depth_image = np.asanyarray(aligned_depth_frame.get_data())
-        color_image = np.asanyarray(color_frame.get_data())
+        depth_raw_dir = depth_raw_dirs[frame_idx]
+        depth_raw_file = os.path.join(depth_raw_path, depth_raw_dir, 'depth_image.npy')
+        depth_frame = np.load(depth_raw_file)
 
         # Run the YOLO model on the frames
         persons = model(color_image)
@@ -220,7 +220,7 @@ try:
                             cv2.putText(color_image, label, (int(x), int(y)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                             cv2.putText(color_image, f"({int(x)}, {int(y)})", (int(x) + 10, int(y) + 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                             keypoints_2d[label] = (int(x), int(y))
-                            x_3d, y_3d, z_3d, min_depth = calculate_3d(int(x), int(y), aligned_depth_frame, color_intrinsics, depth_image.shape[1], depth_image.shape[0])
+                            x_3d, y_3d, z_3d, min_depth = calculate_3d(int(x), int(y), depth_frame, color_intrinsics, depth_frame.shape[1], depth_frame.shape[0])
                             print(f"Keypoint: {label} - 2D: ({x}, {y}), 3D: ({x_3d}, {y_3d}, {z_3d}), Min Depth: {min_depth}")
                             if not np.isnan(z_3d) and (x_3d != 0 or y_3d != 0 or z_3d != 0):
                                 keypoints_3d.append((label, x_3d, y_3d, z_3d))
@@ -233,7 +233,7 @@ try:
                             pelvis_y = (hip_l[1] + hip_r[1]) // 2
                             keypoints_2d['Pelvis'] = (pelvis_x, pelvis_y)
 
-                            x_3d, y_3d, z_3d, min_depth = calculate_3d(pelvis_x, pelvis_y, aligned_depth_frame, color_intrinsics, depth_image.shape[1], depth_image.shape[0])
+                            x_3d, y_3d, z_3d, min_depth = calculate_3d(pelvis_x, pelvis_y, depth_frame, color_intrinsics, depth_frame.shape[1], depth_frame.shape[0])
                             print(f"Keypoint: Pelvis - 2D: ({pelvis_x}, {pelvis_y}), 3D: ({x_3d}, {y_3d}, {z_3d}), Min Depth: {min_depth}")
                             if not np.isnan(z_3d) and (x_3d != 0 or y_3d != 0 or z_3d != 0):
                                 keypoints_3d.append(('Pelvis', x_3d, y_3d, z_3d))
@@ -250,7 +250,7 @@ try:
                             neck_y = (shoulder_l[1] + shoulder_r[1]) // 2
                             keypoints_2d['Neck'] = (neck_x, neck_y)
 
-                            x_3d, y_3d, z_3d, min_depth = calculate_3d(neck_x, neck_y, aligned_depth_frame, color_intrinsics, depth_image.shape[1], depth_image.shape[0])
+                            x_3d, y_3d, z_3d, min_depth = calculate_3d(neck_x, neck_y, depth_frame, color_intrinsics, depth_frame.shape[1], depth_frame.shape[0])
                             print(f"Keypoint: Neck - 2D: ({neck_x}, {neck_y}), 3D: ({x_3d}, {y_3d}, {z_3d}), Min Depth: {min_depth}")
                             if not np.isnan(z_3d) and (x_3d != 0 or y_3d != 0 or z_3d != 0):
                                 keypoints_3d.append(('Neck', x_3d, y_3d, z_3d))
@@ -295,16 +295,16 @@ try:
                         p4 = p3  # The arrow should start at the pelvis point
                         p5 = np.array(neck[1:])
 
-                        arrow_pelvis_start, arrow_pelvis_end, angleX_camera_body_degrees, orientation_body_degrees = calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length=3)
+                        arrow_start, arrow_end, angleX_camera_neck_degrees, orientation_body_degrees = calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length=3)
 
-                        print(f"angleX_camera_body: {angleX_camera_body_degrees} degrees")
+                        print(f"angleX_camera_neck: {angleX_camera_neck_degrees} degrees")
                         if orientation_body_degrees is not None:
-                            print(f"orientation of body: {orientation_body_degrees} degrees")
+                            print(f"orientation: {orientation_body_degrees} degrees")
                         else:
-                            print("orientation of body: No intersection found")
+                            print("orientation: No intersection found")
 
-                        arrow = ax.quiver(arrow_pelvis_start[0], arrow_pelvis_start[1], arrow_pelvis_start[2],
-                                          arrow_pelvis_end[0] - arrow_pelvis_start[0], arrow_pelvis_end[1] - arrow_pelvis_start[1], arrow_pelvis_end[2] - arrow_pelvis_start[2],
+                        arrow = ax.quiver(arrow_start[0], arrow_start[1], arrow_start[2],
+                                          arrow_end[0] - arrow_start[0], arrow_end[1] - arrow_start[1], arrow_end[2] - arrow_start[2],
                                           color='g', length=1.0, arrow_length_ratio=0.1)
                         arrow_plots.append(arrow)
 
@@ -319,7 +319,7 @@ try:
                         p4 = p3  # The arrow should start at the neck point
                         p5 = np.array(neck[1:])
 
-                        arrow_neck_start, arrow_neck_end, angleX_camera_neck_degrees, orientation_head_degrees = calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length=4)
+                        arrow_start, arrow_end, angleX_camera_neck_degrees, orientation_head_degrees = calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length=4)
 
                         print(f"angleX_camera_neck: {angleX_camera_neck_degrees} degrees")
                         if orientation_head_degrees is not None:
@@ -328,26 +328,26 @@ try:
                         else:
                             print("head orientation: No intersection found")
 
-                        arrow = ax.quiver(arrow_neck_start[0], arrow_neck_start[1], arrow_neck_start[2],
-                                          arrow_neck_end[0] - arrow_neck_start[0], arrow_neck_end[1] - arrow_neck_start[1], arrow_neck_end[2] - arrow_neck_start[2],
+                        arrow = ax.quiver(arrow_start[0], arrow_start[1], arrow_start[2],
+                                          arrow_end[0] - arrow_start[0], arrow_end[1] - arrow_start[1], arrow_end[2] - arrow_start[2],
                                           color='r', length=0.5, arrow_length_ratio=0.1)
                         arrow_plots.append(arrow)
 
-                        angle_main = np.arctan2(arrow_neck_end[1] - arrow_neck_start[1], arrow_neck_end[0] - arrow_neck_start[0])
+                        angle_main = np.arctan2(arrow_end[1] - arrow_start[1], arrow_end[0] - arrow_start[0])
                         angles_additional = [angle_main + np.radians(100), angle_main - np.radians(100)]
                         arrow_end_additional = []
                         for angle in angles_additional:
-                            arrow_end_add = arrow_neck_start + 0.5 * np.array([np.cos(angle), np.sin(angle), 0])
+                            arrow_end_add = arrow_start + 0.5 * np.array([np.cos(angle), np.sin(angle), 0])
                             arrow_end_additional.append(arrow_end_add)
-                            arrow = ax.quiver(arrow_neck_start[0], arrow_neck_start[1], arrow_neck_start[2],
-                                              arrow_end_add[0] - arrow_neck_start[0], arrow_end_add[1] - arrow_neck_start[1], arrow_end_add[2] - arrow_neck_start[2],
+                            arrow = ax.quiver(arrow_start[0], arrow_start[1], arrow_start[2],
+                                              arrow_end_add[0] - arrow_start[0], arrow_end_add[1] - arrow_start[1], arrow_end_add[2] - arrow_start[2],
                                               color='r', length=0.5, arrow_length_ratio=0.1)
                             arrow_plots.append(arrow)
 
                         theta = np.linspace(angles_additional[1], angles_additional[0], 100)
-                        x_circle = arrow_neck_start[0] + 0.5 * np.cos(theta)
-                        y_circle = arrow_neck_start[1] + 0.5 * np.sin(theta)
-                        z_circle = np.full_like(x_circle, arrow_neck_start[2])
+                        x_circle = arrow_start[0] + 0.5 * np.cos(theta)
+                        y_circle = arrow_start[1] + 0.5 * np.sin(theta)
+                        z_circle = np.full_like(x_circle, arrow_start[2])
                         circle = ax.plot(x_circle, y_circle, z_circle, color='r')
                         circle_plots.append(circle[0])
 
@@ -356,66 +356,15 @@ try:
                         ax.add_collection3d(sector)
                         sector_plots.append(sector)
 
-                    # Check if the person is turned around
-                    if 'Shoulder.L' in keypoints_2d and 'Shoulder.R' in keypoints_2d and \
-                        (keypoints_2d['Shoulder.L'][0] > keypoints_2d['Shoulder.R'][0]) and \
-                        (('Ear.L' in keypoints_2d and 'Ear.R' in keypoints_2d) and \
-                        not ('Eye.L' in keypoints_2d and 'Eye.R' in keypoints_2d)):
-
-                        print("la persona è girata")  # Aggiungi questa linea
-
-                        if 'Ear.L' in keypoints_2d and 'Ear.R' in keypoints_2d:
-                            ear_l = next(kp for kp in keypoints_3d if kp[0] == 'Ear.L')
-                            ear_r = next(kp for kp in keypoints_3d if kp[0] == 'Ear.R')
-                            neck = next(kp for kp in keypoints_3d if kp[0] == 'Neck')
-
-                            p1 = np.array(ear_l[1:])
-                            p2 = np.array(ear_r[1:])
-                            p3 = np.array(neck[1:])
-                            p4 = p3  # The arrow should start at the neck point
-                            p5 = np.array(neck[1:])
-
-                            arrow_start, arrow_end, angleX_camera_neck_degrees, orientation_head_degrees = calculate_plane_and_arrow(p1, p2, p3, p4, p5, arrow_length=4)
-
-                            arrow = ax.quiver(arrow_start[0], arrow_start[1], arrow_start[2],
-                                              arrow_end[0] - arrow_start[0], arrow_end[1] - arrow_start[1], arrow_end[2] - arrow_start[2],
-                                              color='r', length=0.5, arrow_length_ratio=0.1)
-                            arrow_plots.append(arrow)
-
-                            angle_main = np.arctan2(arrow_end[1] - arrow_start[1], arrow_end[0] - arrow_start[0])
-                            angles_additional = [angle_main + np.radians(100), angle_main - np.radians(100)]
-                            arrow_end_additional = []
-                            for angle in angles_additional:
-                                arrow_end_add = arrow_start + 0.5 * np.array([np.cos(angle), np.sin(angle), 0])
-                                arrow_end_additional.append(arrow_end_add)
-                                arrow = ax.quiver(arrow_start[0], arrow_start[1], arrow_start[2],
-                                                  arrow_end_add[0] - arrow_start[0], arrow_end_add[1] - arrow_start[1], arrow_end_add[2] - arrow_start[2],
-                                                  color='r', length=0.5, arrow_length_ratio=0.1)
-                                arrow_plots.append(arrow)
-
-                            theta = np.linspace(angles_additional[1], angles_additional[0], 100)
-                            x_circle = arrow_start[0] + 0.5 * np.cos(theta)
-                            y_circle = arrow_start[1] + 0.5 * np.sin(theta)
-                            z_circle = np.full_like(x_circle, arrow_start[2])
-                            circle = ax.plot(x_circle, y_circle, z_circle, color='r')
-                            circle_plots.append(circle[0])
-
-                            verts = [list(zip(x_circle, y_circle, z_circle))]
-                            sector = Poly3DCollection(verts, color='red', alpha=0.2)
-                            ax.add_collection3d(sector)
-                            sector_plots.append(sector)
-
         plt.draw()
         plt.pause(0.001)
 
         cv2.imshow('YOLO Keypoints', color_image)
-        
         if cv2.waitKey(1) == ord('q'):
             break
 
 except Exception as e:
-    print(f"Errore: {e}")
+    print(f"Error: {e}")
 
 finally:
-    pipeline.stop()
     cv2.destroyAllWindows()
